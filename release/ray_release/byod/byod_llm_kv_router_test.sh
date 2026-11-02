@@ -8,4 +8,5 @@ pip3 install --no-cache-dir fastokens==0.2.0
 
 # --no-deps: ai-dynamo-runtime constrains pydantic and uvloop, both already
 # pinned by the base llm image's vLLM install.
-pip3 install --no-cache-dir --no-deps ai-dynamo-runtime==1.4.0
+# Includes removal of departed workers from the selector catalog.
+pip3 install --no-cache-dir --no-deps ai-dynamo-runtime==1.6.0.dev20260918

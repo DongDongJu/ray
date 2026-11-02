@@ -62,10 +62,11 @@ OFFLOAD_MESSAGES = [
 ]
 
 
-def post_chat(endpoint, messages=MESSAGES, max_tokens=MAX_TOKENS):
+def post_chat(endpoint, messages=MESSAGES, max_tokens=MAX_TOKENS, request_id=None):
     host, port = endpoint
     response = requests.post(
         f"http://{host}:{port}/v1/chat/completions",
+        headers={"X-Request-Id": request_id} if request_id else None,
         json={
             "model": MODEL_ID,
             "messages": messages,
@@ -469,6 +470,9 @@ class TestKvScoring:
                 max_model_len=2048,
                 enforce_eager=True,
                 gpu_memory_utilization=0.4,
+                enable_prefix_caching=True,
+                enable_prompt_tokens_details=True,
+                enable_force_include_usage=True,
             ),
             experimental_configs={"KV_EVENTS_PORT_BASE": 21600},
             runtime_env=dict(
@@ -479,8 +483,9 @@ class TestKvScoring:
             ),
             log_engine_metrics=False,
         )
-        app = build_kv_app(llm_config)
-        handle = serve.run(app, name="kv_scoring_gpu_test")
+        with patch_ingress():
+            app = build_kv_app(llm_config)
+            handle = serve.run(app, name="kv_scoring_gpu_test")
         yield handle
         serve.shutdown()
 
@@ -499,19 +504,200 @@ class TestKvScoring:
         prompt_token_ids = tokenize_prompt(cached_endpoint)
         assert num_prompt_blocks(prompt_token_ids) >= 2
 
-        # Worker registration and KV-event indexing are asynchronous, so poll the
-        # scoring path until it converges on the replica holding the cached blocks.
+        router = serve.get_deployment_handle(
+            "LLMRouter", app_name="kv_scoring_gpu_test"
+        )
+
+        # Read the ingress's index: the driver handle has no ingress-local tracker.
         async def routes_to_cached_replica():
-            picks = set()
-            for _ in range(3):
-                async with kv_aware_handle.choose_replica(
-                    _reserve=False,
-                    request_token_ids=prompt_token_ids,
-                ) as selection:
-                    picks.add(selection._replica.replica_id.to_full_id_str())
-            return picks == {cached_id}
+            mappings = await router.broadcast(
+                "get_kv_event_worker_replicas"
+            ).results_async()
+            assert mappings and all(m == mappings[0] for m in mappings), mappings
+            replicas = mappings[0]
+            assert (
+                len(replicas) == NUM_REPLICAS and cached_id in replicas.values()
+            ), replicas
+            for overlaps in await router.broadcast(
+                "get_kv_overlap_blocks", prompt_token_ids
+            ).results_async():
+                for worker, replica_id in replicas.items():
+                    if replica_id == cached_id:
+                        assert overlaps.get(worker) == num_prompt_blocks(
+                            prompt_token_ids
+                        ), overlaps
+                    else:
+                        assert overlaps.get(worker, 0) < num_prompt_blocks(
+                            prompt_token_ids
+                        ), overlaps
+            return True
 
         await async_wait_for_condition(routes_to_cached_replica, timeout=120)
+        await router.broadcast("reset_token_pushes").results_async()
+        request_id = "kv-higher-overlap"
+        response = post_chat(("127.0.0.1", 8000), request_id=request_id)
+        reports = await router.broadcast("get_token_push_report").results_async()
+        picks = [
+            p
+            for report in reports
+            for p in report["pushes"]
+            if p["request_id"] == request_id
+        ]
+        assert picks and all(p["replica_id"] == cached_id for p in picks), reports
+        assert response["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(900)
+    async def test_replica_replacement_clears_old_kv_state(self, kv_aware_handle):
+        """Replacing one model replica preserves the survivor's indexed cache."""
+        router = serve.get_deployment_handle(
+            "LLMRouter", app_name="kv_scoring_gpu_test"
+        )
+        replica_endpoints = await discover_replica_endpoints(
+            kv_aware_handle, NUM_REPLICAS
+        )
+
+        async def all_registered():
+            states = await router.broadcast("get_kv_routing_state").results_async()
+            assert states
+            for state in states:
+                assert sorted(state["replicas"].values()) == sorted(
+                    replica_endpoints
+                ), state
+                assert len(state["workers"]) == NUM_REPLICAS, state
+            return True
+
+        await async_wait_for_condition(all_registered, timeout=90)
+        before_states = await router.broadcast("get_kv_routing_state").results_async()
+        identities = {state["identity"] for state in before_states}
+        before = before_states[0]
+        departed, survivor = sorted(before["replicas"])
+        departed_id = before["replicas"][departed]
+        survivor_id = before["replicas"][survivor]
+        departed_actor = ray.get_actor(departed_id, namespace="serve")
+        survivor_actor = ray.get_actor(survivor_id, namespace="serve")
+        targets = [
+            [
+                {
+                    "role": "user",
+                    "content": "Replacement target: " + "orchid amber " * 80,
+                }
+            ],
+            [{"role": "user", "content": "Surviving target: " + "birch indigo " * 80}],
+        ]
+        tokens = []
+        for worker, messages in zip((departed, survivor), targets):
+            endpoint = replica_endpoints[before["replicas"][worker]]
+            tokens.append(tokenize_prompt(endpoint, messages))
+            post_chat(endpoint, messages, max_tokens=2)
+        shared_blocks = (
+            next(i for i, (p, q) in enumerate(zip(*tokens)) if p != q) // BLOCK_SIZE
+        )
+        blocks = [num_prompt_blocks(t) for t in tokens]
+        assert all(n > shared_blocks + 2 for n in blocks)
+
+        async def targets_indexed():
+            for worker, target, expected in zip((departed, survivor), tokens, blocks):
+                for overlaps in await router.broadcast(
+                    "get_kv_overlap_blocks", target
+                ).results_async():
+                    assert overlaps.get(worker) == expected, overlaps
+                    other = survivor if worker == departed else departed
+                    assert overlaps.get(other, 0) <= shared_blocks, overlaps
+                loads = await router.broadcast(
+                    "get_worker_active_requests", worker
+                ).results_async()
+                assert all(load == 0 for load in loads), loads
+            return True
+
+        await async_wait_for_condition(targets_indexed, timeout=60)
+        before_states = await router.broadcast("get_kv_routing_state").results_async()
+        assert {
+            state["identity"] for state in before_states
+        } == identities, before_states
+        assert all(
+            {departed, survivor} <= set(state["indexed_workers"])
+            for state in before_states
+        ), before_states
+        print(
+            "Before replacement:", before_states, "target blocks:", blocks, flush=True
+        )
+        ray.kill(departed_actor)
+
+        async def replacement_registered():
+            states = await router.broadcast("get_kv_routing_state").results_async()
+            assert {state["identity"] for state in states} == identities, states
+            for state in states:
+                assert len(state["replicas"]) == NUM_REPLICAS, state
+                assert departed not in state["replicas"], state
+                assert departed not in state["indexed_workers"], state
+                assert survivor in state["indexed_workers"], state
+                assert state["replicas"].get(survivor) == survivor_id, state
+                assert {w["worker_id"] for w in state["workers"]} == set(
+                    state["replicas"]
+                ), state
+                assert all(
+                    w["lifecycle"] == "schedulable" for w in state["workers"]
+                ), state
+                assert all(
+                    load["worker_id"] != departed
+                    for model in state["loads"]
+                    for load in model["loads"]
+                ), state
+            return True
+
+        await async_wait_for_condition(replacement_registered, timeout=300)
+        after_states = await router.broadcast("get_kv_routing_state").results_async()
+        after = after_states[0]
+        replacement = (set(after["replicas"]) - {survivor}).pop()
+        replacement_id = after["replicas"][replacement]
+        assert replacement_id not in before["replicas"].values(), after
+        assert (
+            ray.get_actor(replacement_id, namespace="serve")._actor_id
+            != departed_actor._actor_id
+        )
+        assert (
+            ray.get_actor(survivor_id, namespace="serve")._actor_id
+            == survivor_actor._actor_id
+        )
+
+        async def cache_converged():
+            for i, target in enumerate(tokens):
+                for overlaps in await router.broadcast(
+                    "get_kv_overlap_blocks", target
+                ).results_async():
+                    assert departed not in overlaps, overlaps
+                    assert overlaps.get(replacement, 0) <= shared_blocks, overlaps
+                    if i == 1:
+                        assert overlaps.get(survivor) == blocks[1], overlaps
+            for worker in (survivor, replacement):
+                loads = await router.broadcast(
+                    "get_worker_active_requests", worker
+                ).results_async()
+                assert all(load == 0 for load in loads), loads
+            return True
+
+        await async_wait_for_condition(cache_converged, timeout=60)
+        print("After replacement:", after_states, flush=True)
+        await router.broadcast("reset_token_pushes").results_async()
+        request_id = "kv-replacement-survivor"
+        response = post_chat(
+            ("127.0.0.1", 8000), targets[1], max_tokens=2, request_id=request_id
+        )
+        reports = await router.broadcast("get_token_push_report").results_async()
+        picks = [
+            p
+            for report in reports
+            for p in report["pushes"]
+            if p["request_id"] == request_id
+        ]
+        assert picks and all(p["replica_id"] == survivor_id for p in picks), reports
+        cached_tokens = response["usage"]["prompt_tokens_details"]["cached_tokens"]
+        assert cached_tokens > shared_blocks * BLOCK_SIZE, response
+        states = await router.broadcast("get_kv_routing_state").results_async()
+        assert {state["identity"] for state in states} == identities, states
+        assert not any(await router.broadcast("get_errors").results_async())
+        print("Survivor request:", request_id, picks, response["usage"], flush=True)
 
 
 class TestFastokens:

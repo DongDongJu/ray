@@ -139,6 +139,8 @@ class LLMRouter(_LLMRouter):
             dict(
                 endpoint=token_endpoint,
                 sent=key is not None,
+                replica_id=replica_id,
+                request_id=serve.context._get_serve_request_context().request_id,
             )
         )
         return key
@@ -182,6 +184,24 @@ class LLMRouter(_LLMRouter):
     def get_kv_event_worker_replicas(self):
         """(Test only) Registered Dynamo worker id -> replica full id mapping."""
         return dict(self._kv_token_tracker._replica_id_by_worker)
+
+    async def get_kv_routing_state(self):
+        """(Test only) Identity, membership and load without changing routing state."""
+        tracker = self._kv_token_tracker
+        svc = tracker._svc
+        return dict(
+            identity=(self.get_replica_id(), id(tracker), id(svc)),
+            replicas=dict(tracker._replica_id_by_worker),
+            workers=svc.list_workers(model_name=_MODEL_NAME, routing_group=_TENANT_ID),
+            loads=svc.loads(model_name=_MODEL_NAME, routing_group=_TENANT_ID),
+            indexed_workers=sorted(
+                {
+                    event["worker_id"]
+                    for partition in (await svc.indexer_snapshot()).values()
+                    for event in partition["events"]
+                }
+            ),
+        )
 
     def get_candidate_worker_ids(self):
         """(Test only) Workers currently tracked from running replicas."""
