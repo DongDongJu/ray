@@ -57,6 +57,10 @@ class MPWorkerExtension:
         connector = get_kv_transfer_group()
         adapter = self._mp_adapter
         process = adapter._mp_server_launcher._process
+        model_revision = self.model_config.revision
+        tokenizer_revision = self.model_config.tokenizer_revision
+        model_source = self.model_config.model
+        tokenizer_source = self.model_config.tokenizer
         return dict(
             server_url=adapter._server_url,
             server_pid=process.pid if process else None,
@@ -65,7 +69,16 @@ class MPWorkerExtension:
             worker_pid=os.getpid(),
             healthy=adapter.is_healthy,
             chunk_size=adapter.lmcache_tokens_per_chunk,
-            model_revision=self.model_config.hf_config._commit_hash,
+            # ResolvedRevision subclasses str but worker RPC requires plain strings.
+            model_revision=str(model_revision) if model_revision is not None else None,
+            tokenizer_revision=(
+                str(tokenizer_revision) if tokenizer_revision is not None else None
+            ),
+            model_source=str(model_source) if model_source is not None else None,
+            tokenizer_source=(
+                str(tokenizer_source) if tokenizer_source is not None else None
+            ),
+            revision_basis="configured_loader_revision",
             connector_class=f"{type(connector).__module__}.{type(connector).__qualname__}",
             lmcache_module=lmcache.__file__,
             cuda_extension=lmcache.cuda_ops.__file__,

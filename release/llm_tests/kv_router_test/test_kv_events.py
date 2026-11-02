@@ -387,11 +387,13 @@ class TestKvOffload:
         # Each unique prompt displaces old GPU blocks. Native offload retains
         # the target in CPU memory and emits CPU-tier events as that happens.
         async def target_is_only_on_cpu():
-            scores = await router.get_kv_overlap_scores.remote(target_tokens)
-            cached_score = scores.get(cached_worker, {})
-            return (
-                cached_score.get("device_blocks") == 0
-                and cached_score.get("host_pinned_blocks", 0) > 0
+            scores = await router.broadcast(
+                "get_kv_overlap_scores", target_tokens
+            ).results_async()
+            return bool(scores) and all(
+                score.get(cached_worker, {}).get("device_blocks") == 0
+                and score.get(cached_worker, {}).get("host_pinned_blocks", 0) > 0
+                for score in scores
             )
 
         offloaded = False
@@ -419,18 +421,38 @@ class TestKvOffload:
         cached_score = scores[cached_worker]
         miss_score = scores[miss_worker]
         assert cached_score["host_pinned_extension_blocks"] > 0
-        assert (
-            0
-            < cached_score["router_credit_blocks"]
-            < cached_score["host_pinned_blocks"]
-        )
         assert miss_score["device_blocks"] == 0
         assert miss_score["host_pinned_blocks"] == 0
 
         # Exercise the production HAProxy -> LLMRouter -> KVAwareRouter path.
         # The response can only report a cache hit if it reached the replica
         # whose target prefix is still available in CPU memory.
-        response = post_chat(("127.0.0.1", 8000), OFFLOAD_MESSAGES, max_tokens=2)
+        await router.broadcast("reset_token_pushes").results_async()
+        request_id = "native-offload-reload"
+        response = post_chat(
+            ("127.0.0.1", 8000),
+            OFFLOAD_MESSAGES,
+            max_tokens=2,
+            request_id=request_id,
+        )
+        reports = await router.broadcast("get_token_push_report").results_async()
+        selections = [
+            selection
+            for report in reports
+            for selection in report["selections"]
+            if selection["request_id"] == request_id
+        ]
+        assert selections, reports
+        assert response["usage"]["prompt_tokens"] == len(target_tokens), response
+        for selection in selections:
+            assert selection["worker_id"] == cached_worker, reports
+            assert selection["prompt_tokens"] == len(target_tokens), reports
+            uncached_tail = selection["prompt_tokens"] - selection["overlap_tokens"]
+            assert (
+                uncached_tail
+                < selection["effective_prefill_tokens"]
+                < len(target_tokens)
+            ), reports
         assert response["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
 
         # The request was served from CPU and the loaded blocks are visible on

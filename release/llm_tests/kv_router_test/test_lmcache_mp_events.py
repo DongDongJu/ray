@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from urllib.parse import urlsplit
 import uuid
 
@@ -34,7 +34,12 @@ from test_kv_events import (
     post_chat,
     tokenize_prompt,
 )
-from utils import build_kv_app, discover_replica_endpoints, patch_ingress
+from utils import (
+    build_kv_app,
+    discover_replica_endpoints,
+    observe_selection,
+    patch_ingress,
+)
 
 APP_NAME = "lmcache_mp_gpu_test"
 MODEL_REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
@@ -79,7 +84,16 @@ def mp_report(endpoint):
     host, port = endpoint
     response = requests.get(f"http://{host}:{port}/test/mp", timeout=45)
     response.raise_for_status()
-    return response.json()
+    report = response.json()
+    for kind in ("model", "tokenizer"):
+        source = report[f"{kind}_source"]
+        if source is not None:
+            path = Path(source)
+            if path.is_absolute() and "snapshots" in path.parts:
+                revision_index = path.parts.index("snapshots") + 1
+                assert revision_index < len(path.parts), report
+                assert path.parts[revision_index] == report[f"{kind}_revision"], report
+    return report
 
 
 def mp_status(endpoint):
@@ -209,6 +223,7 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
     reports = [mp_report(endpoint) for endpoint in (a, b)]
     assert_mp_owners(endpoints, reports, node_ips)
     assert all(r["model_revision"] == MODEL_REVISION for r in reports), reports
+    assert all(r["tokenizer_revision"] == MODEL_REVISION for r in reports), reports
     assert all(r["chunk_size"] == chunk_size for r in reports), reports
     assert all(r["healthy"] for r in reports), reports
     tokens = tokenize_prompt(a, TARGET)
@@ -255,32 +270,7 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
                     score[cached]["host_pinned_blocks"]
                     == score[cached]["device_blocks"]
                 ), score
-                assert (
-                    score[cached]["router_credit_blocks"]
-                    == score[cached]["device_blocks"]
-                ), score
         return True
-
-    await async_wait_for_condition(indexed, timeout=60)
-    initial_index = await router.broadcast("get_kv_index_snapshot").results_async()
-    assert (
-        mp_report(a)["status"]["storage_manager"]["l1_manager"]["total_object_count"]
-        > 0
-    )
-    assert (
-        mp_report(b)["status"]["storage_manager"]["l1_manager"]["total_object_count"]
-        == 0
-    )
-    for i in range(3):
-        filler = [
-            {"role": "user", "content": f"GPU eviction {i}. " + f"filler-{i} " * 200}
-        ]
-        post_chat(a, filler, max_tokens=1)
-
-    async def cpu_only_indexed():
-        return await indexed(cpu_only=True)
-
-    await async_wait_for_condition(cpu_only_indexed, timeout=60)
 
     async def idle():
         for worker in (cached, cold):
@@ -293,6 +283,52 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
                 for load in loads
             ), loads
         return True
+
+    await async_wait_for_condition(indexed, timeout=60)
+    initial_index = await router.broadcast("get_kv_index_snapshot").results_async()
+    assert (
+        mp_report(a)["status"]["storage_manager"]["l1_manager"]["total_object_count"]
+        > 0
+    )
+    assert (
+        mp_report(b)["status"]["storage_manager"]["l1_manager"]["total_object_count"]
+        == 0
+    )
+    await async_wait_for_condition(idle, timeout=30)
+    await router.broadcast("reset_token_pushes").results_async()
+    warm_request_id = f"lmcache-mp-gpu-warm-{uuid.uuid4().hex}"
+    warm_response = post_chat(
+        (b[0] if node_ips else "127.0.0.1", 8000),
+        TARGET,
+        max_tokens=2,
+        request_id=warm_request_id,
+    )
+    warm_reports = await router.broadcast("get_token_push_report").results_async()
+    warm_selections = [
+        selection
+        for report in warm_reports
+        for selection in report["selections"]
+        if selection["request_id"] == warm_request_id
+    ]
+    assert warm_selections, warm_reports
+    assert warm_response["usage"]["prompt_tokens"] == len(tokens), warm_response
+    for selection in warm_selections:
+        assert selection["worker_id"] == cached, warm_reports
+        assert selection["prompt_tokens"] == len(tokens), warm_reports
+        # GPU and CPU copies must not reduce work below the uncached tail.
+        assert (
+            selection["effective_prefill_tokens"] == len(tokens) % BLOCK_SIZE
+        ), warm_reports
+    for i in range(3):
+        filler = [
+            {"role": "user", "content": f"GPU eviction {i}. " + f"filler-{i} " * 200}
+        ]
+        post_chat(a, filler, max_tokens=1)
+
+    async def cpu_only_indexed():
+        return await indexed(cpu_only=True)
+
+    await async_wait_for_condition(cpu_only_indexed, timeout=60)
 
     await async_wait_for_condition(idle, timeout=30)
     cpu_only_scores = await router.broadcast(
@@ -321,6 +357,22 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
     assert picks and all(
         p["replica_id"] == state["replicas"][cached] for p in picks
     ), routes
+    selections = [
+        selection
+        for report in routes
+        for selection in report["selections"]
+        if selection["request_id"] == request_id
+    ]
+    assert selections, routes
+    assert response["usage"]["prompt_tokens"] == len(tokens), response
+    for selection in selections:
+        assert selection["worker_id"] == cached, routes
+        assert selection["prompt_tokens"] == len(tokens), routes
+        assert (
+            len(tokens) - blocks * BLOCK_SIZE
+            < selection["effective_prefill_tokens"]
+            < len(tokens)
+        ), routes
     if node_ips:
         # A first nonblocking push may fall back; the MP load is checked below.
         assert all(
@@ -361,6 +413,11 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
                 route_reports=routes,
                 node_ips=node_ips,
                 initial_index=initial_index,
+                gpu_warm_request=dict(
+                    request_id=warm_request_id,
+                    response=warm_response,
+                    reports=warm_reports,
+                ),
                 cpu_only_scores=cpu_only_scores,
                 idle_loads=idle_loads,
                 restored_scores=restored_scores,
@@ -370,6 +427,24 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
             default=str,
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_selection_observer_preserves_actual_reservation():
+    selection = dict(
+        worker_id=7, dp_rank=0, overlap_tokens=48, effective_prefill_tokens=8
+    )
+    original = AsyncMock(return_value=selection)
+    reports = []
+    tokens = list(range(48))
+    result = await observe_selection(
+        original, reports, "request", tokens, [7, 8], expected_output_tokens=2
+    )
+    assert result is selection
+    original.assert_awaited_once_with(
+        "request", tokens, [7, 8], expected_output_tokens=2
+    )
+    assert reports == [dict(request_id="request", prompt_tokens=48, **selection)]
 
 
 def test_retrieve_observer_rejects_failed_and_dropped_loads():
@@ -488,6 +563,10 @@ async def test_lmcache_mp_idle_invalidation_preserves_live_replicas(mp_app, oper
     a, b = (endpoints[state["replicas"][w]] for w in (cached, cold))
     models = [mp_report(endpoint) for endpoint in (a, b)]
     assert_mp_owners(endpoints, models, node_ips)
+    assert all(
+        model["model_revision"] == model["tokenizer_revision"] == MODEL_REVISION
+        for model in models
+    ), models
     tokens = tokenize_prompt(a, TARGET)
     blocks = len(tokens) // chunk_size * chunk_size // BLOCK_SIZE
     gpu_target = [{"role": "user", "content": "GPU survivor. " + "cobalt pine " * 150}]

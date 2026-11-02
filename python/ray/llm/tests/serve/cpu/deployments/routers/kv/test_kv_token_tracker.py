@@ -210,10 +210,14 @@ async def test_lifecycle_booking_end_to_end():
 
 
 @pytest.mark.asyncio
-async def test_peer_trackers_converge_through_request_lifecycle():
+@pytest.mark.parametrize("routing_group", ["default", "contract-group"])
+async def test_peer_trackers_converge_through_request_lifecycle(
+    monkeypatch, routing_group
+):
     """One atomic selection is replicated so every selection service books the
     same request, applies prefill completion, and frees it."""
     pytest.importorskip("dynamo.llm")
+    monkeypatch.setattr(kv_token_tracker, "_TENANT_ID", routing_group)
 
     routing = _NoLongPollTracker(ingress_replica_rank=0)
     peer = _NoLongPollTracker(ingress_replica_rank=1)
@@ -235,6 +239,10 @@ async def test_peer_trackers_converge_through_request_lifecycle():
                     "dp_rank": 0,
                 },
             )
+            registered = tracker._svc.list_workers(routing_group=routing_group)
+            assert [worker["worker_id"] for worker in registered] == [worker_id]
+            if routing_group != "default":
+                assert tracker._svc.list_workers(routing_group="default") == []
 
         # Exactly one ingress scores and reserves. Its background broadcast
         # tells every peer to book the already-selected worker.
@@ -265,6 +273,8 @@ async def test_peer_trackers_converge_through_request_lifecycle():
         assert loads[0][1] > 0
         assert all("req-bcast" in tracker._requests for tracker in trackers)
         assert peer._svc.create_reservation_calls[0]["lora_name"] == "adapter-a"
+        assert peer._svc.create_reservation_calls[0]["routing_group"] == routing_group
+        assert "tenant_id" not in peer._svc.create_reservation_calls[0]
 
         prefill = [("on_prefill_complete", ("req-bcast",))]
         for tracker in trackers:

@@ -10,6 +10,7 @@ exposes the tracker's state as handle-callable methods.
 import asyncio
 from contextlib import contextmanager
 from dataclasses import asdict
+from functools import partial
 import sys
 from unittest import mock
 
@@ -110,6 +111,23 @@ class _TestKVAwareRouter(RoundRobinRouter, KVAwareRouter):
     """
 
 
+async def observe_selection(original, reports, request_id, token_ids, *args, **kwargs):
+    """Observe one actual reservation without issuing or modifying another."""
+    prompt_tokens = len(token_ids)
+    selection = await original(request_id, token_ids, *args, **kwargs)
+    reports.append(
+        dict(
+            request_id=request_id,
+            prompt_tokens=prompt_tokens,
+            worker_id=selection["worker_id"],
+            dp_rank=selection["dp_rank"],
+            overlap_tokens=selection["overlap_tokens"],
+            effective_prefill_tokens=selection["effective_prefill_tokens"],
+        )
+    )
+    return selection
+
+
 class LLMRouter(_LLMRouter):
     """(Test only) LLMRouter that exposes its embedded KVTokenTracker over the
     deployment handle for the KV-router release tests.
@@ -125,6 +143,13 @@ class LLMRouter(_LLMRouter):
         self._event_log = []
         self._errors = []
         self._token_pushes = []
+        self._selections = []
+        if self._kv_token_tracker is not None:
+            self._kv_token_tracker.select_worker = partial(
+                observe_selection,
+                self._kv_token_tracker.select_worker,
+                self._selections,
+            )
         renderer = self._tokenizer._renderer.renderer
         self._chat_render = mock.AsyncMock(wraps=renderer.render_chat_async)
         renderer.render_chat_async = self._chat_render
@@ -172,12 +197,14 @@ class LLMRouter(_LLMRouter):
 
     def reset_token_pushes(self):
         self._token_pushes.clear()
+        self._selections.clear()
         self._chat_render.reset_mock()
 
     def get_token_push_report(self):
         return dict(
             node_ip=ray.util.get_node_ip_address(),
             pushes=list(self._token_pushes),
+            selections=list(self._selections),
             tokenizations=self._chat_render.await_count,
         )
 
@@ -241,7 +268,7 @@ class LLMRouter(_LLMRouter):
         scores = await svc.overlap_scores(
             {
                 "model_name": _MODEL_NAME,
-                "tenant_id": _TENANT_ID,
+                "routing_group": _TENANT_ID,
                 "token_ids": list(token_ids),
                 "lora_name": lora_name,
             }

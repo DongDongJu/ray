@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
 # Dynamo's selection service keys all worker, indexer, and load state by
-# (model_name, tenant_id). KVTokenTracker instantiates a selection service and
+# (model_name, routing_group). KVTokenTracker instantiates a selection service and
 # serves exactly one model, so a single fixed key scopes all of its workers
 # together.
 _MODEL_NAME = "default"
@@ -383,7 +383,7 @@ class KVTokenTracker:
             {
                 "worker_id": worker_id,
                 "model_name": _MODEL_NAME,
-                "tenant_id": _TENANT_ID,
+                "routing_group": _TENANT_ID,
                 # NOTE: SelectionService requires endpoint to be non-empty although it's left
                 # unused under an external runtime like Ray Serve LLM.
                 # TODO (jeffreywang): Allow empty endpoints upstream.
@@ -448,7 +448,7 @@ class KVTokenTracker:
         await self._evict_stale_requests()
         request = {
             "model_name": _MODEL_NAME,
-            "tenant_id": _TENANT_ID,
+            "routing_group": _TENANT_ID,
             "selection_id": request_id,
             "token_ids": token_ids,
             "allowed_worker_ids": allowed_worker_ids,
@@ -562,7 +562,7 @@ class KVTokenTracker:
             await self._svc.create_reservation(
                 {
                     "model_name": _MODEL_NAME,
-                    "tenant_id": _TENANT_ID,
+                    "routing_group": _TENANT_ID,
                     "selection_id": request_id,
                     "worker_id": reservation["worker_id"],
                     "dp_rank": reservation["dp_rank"],

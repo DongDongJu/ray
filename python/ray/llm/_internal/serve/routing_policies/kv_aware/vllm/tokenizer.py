@@ -7,7 +7,7 @@ from vllm.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
 )
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
-from vllm.entrypoints.launchers.cli_args import FrontendArgs
+from vllm.entrypoints.common.cli_args import FrontendArgs
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
