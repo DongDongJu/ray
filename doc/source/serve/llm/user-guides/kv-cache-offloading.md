@@ -217,7 +217,7 @@ serve run config.yaml
 ### Validate replica-local LMCache MP routing
 
 :::{note}
-The MP routing test requires the unmerged native-event LMCache change at commit `38fc36efd6476307cc0504fe039e039277d0b771`, vLLM 0.31.0, and Dynamo runtime `1.6.0.dev20260918`. The standard Ray LLM image doesn't include that LMCache artifact. Before building the manual `llm_serve_kv_router_lmcache_mp` release job, set `cluster.byod.runtime_env.LMCACHE_MP_WHEEL` to a reviewed immutable wheel URL. Its empty default fails the image build. This dependency gate must be resolved before treating the configuration as released support.
+The MP routing and invalidation tests require the unmerged LMCache scheduler-event change at commit `70da29961e266d6318179eb1a41d37b6c47fc330`, the vLLM idle-event change at commit `6232e45f29eee29df83de5d8bd48fede866898f3` backported to vLLM 0.31.0, and Dynamo runtime `1.6.0.dev20260918`. The standard Ray LLM image doesn't include these artifacts. Before building the manual `llm_serve_kv_router_lmcache_mp` release job, set `cluster.byod.runtime_env.LMCACHE_MP_WHEEL` and `VLLM_KV_EVENTS_WHEEL` to reviewed immutable wheel URLs. Their empty defaults fail the image build. LMCache's CUDA binary must include SM89 for the job's L4 GPUs. These dependency gates must be resolved before treating the configuration as released support.
 :::
 
 Use the external `LMCacheMPConnector` module so vLLM loads the selected LMCache installation. The release test uses the following connector settings with `chunk_size` set to 16 and 256 and the engine block size fixed at 16:
@@ -240,7 +240,9 @@ python -m pytest -vs release/llm_tests/kv_router_test/test_lmcache_mp_events.py
 ```
 
 :::{note}
-The native-event dependency above doesn't provide bounded invalidation delivery while vLLM is idle. CPU eviction and MP restart need separate validation before deployments can rely on prompt withdrawal of stale routing hints.
+The invalidation tests use a real MP cache clear and a separate MP process restart while both model replicas and all ingress instances remain alive. They keep a CPU-only target and a separate valid GPU prefix, then observe raw CPU removals and unchanged GPU identities without sending inference requests during invalidation. The 15-second delivery budget accounts for the configured one-second heartbeat, five-second request timeout, up to five-second subscription reconnect backoff, and vLLM's 100-ms idle publication interval. Restart additionally budgets the launcher's two ten-second shutdown waits, a ten-second unhealthy-state observation, and its configured startup timeout (90 seconds by default). Deadlines use the driver's monotonic clock and include the control operation; these are test bounds, not public freshness SLAs.
+
+After withdrawal, the tests exercise normal public serving without MP reuse and explicitly warm a new prefix on the affected replica, establishing fresh storage in its current MP incarnation. Cache events remain placement hints; they do not guarantee a hit at retrieval time. These tests cover the private DRAM, TP=1 topology above, not shared MP pools or general parallel serving layouts.
 :::
 
 ## Compose multiple KV transfer backends with MultiConnector

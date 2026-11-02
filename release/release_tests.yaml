@@ -5254,6 +5254,7 @@
       runtime_env:
         # Supply a reviewed immutable wheel URL before building this manual job.
         LMCACHE_MP_WHEEL: ""
+        VLLM_KV_EVENTS_WHEEL: ""
         RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING: "1"
         RAY_SERVE_ENABLE_HA_PROXY: "1"
         RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY: "1"

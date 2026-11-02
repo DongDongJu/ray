@@ -1,5 +1,8 @@
 """Test-only MP ownership and completed-load observations on the model node."""
 
+import os
+import time
+
 import httpx
 
 from ray import serve
@@ -56,7 +59,9 @@ class MPWorkerExtension:
         return dict(
             server_url=adapter._server_url,
             server_pid=process.pid if process else None,
+            server_start_timeout=adapter._mp_server_launcher.config.wait_timeout,
             instance_id=adapter.instance_id,
+            worker_pid=os.getpid(),
             healthy=adapter.is_healthy,
             chunk_size=adapter.lmcache_tokens_per_chunk,
             model_revision=self.model_config.hf_config._commit_hash,
@@ -74,6 +79,29 @@ class MPWorkerExtension:
         process = adapter._mp_server_launcher._process
         adapter._mp_server_launcher.shutdown()
         assert process is None or process.poll() is not None
+
+    def mp_restart(self):
+        """Replace only the owned MP child, retaining the worker's GPU cache."""
+        import zmq
+
+        adapter = self._mp_adapter
+        launcher = adapter._mp_server_launcher
+        old_pid = launcher._process.pid
+        started = time.time()
+        launcher.shutdown()
+        # Recovery re-registers GPU handles on the unhealthy-to-healthy edge.
+        deadline = time.monotonic() + 10
+        while adapter.is_healthy:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("MP heartbeat did not observe the stopped server")
+            time.sleep(0.05)
+        launcher.start(adapter._server_url, zmq.Context.instance())
+        return dict(
+            started=started,
+            completed=time.time(),
+            old_pid=old_pid,
+            new_pid=launcher._process.pid,
+        )
 
 
 class MPTestServer(LLMServer):
@@ -116,6 +144,22 @@ class MPTestServer(LLMServer):
         async def status():
             # This read must never wake the model engine during idle-invalidation tests.
             return await self.mp_status()
+
+        @app.post("/test/mp/clear")
+        async def clear():
+            started = time.time()
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    f"http://127.0.0.1:{self._mp_http_port}/cache/clear",
+                    json={"tier": "l1", "force": False},
+                )
+                response.raise_for_status()
+            return dict(started=started, completed=time.time(), result=response.json())
+
+        @app.post("/test/mp/restart")
+        async def restart():
+            [operation] = await self.collective_rpc("mp_restart", timeout=150)
+            return operation
 
         return app
 
