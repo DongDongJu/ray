@@ -1,11 +1,16 @@
-"""Real replica-local MP reuse; requires the native-event LMCache dependency."""
+"""Real replica-local MP reuse; requires the native-event LMCache dependency.
+
+Set RAY_LMCACHE_MP_TWO_NODE=1 for two nodes advertising one GPU each.
+"""
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import time
 from types import SimpleNamespace
 from unittest.mock import Mock
+from urllib.parse import urlsplit
 import uuid
 
 import pytest
@@ -41,6 +46,33 @@ TARGET = [
 ]
 # 5s RPC timeout + up to 5s subscription backoff + 1s heartbeat + 0.1s idle poll.
 INVALIDATION_TIMEOUT = 15
+
+
+def two_node_gpu_owners(nodes):
+    gpu_nodes = [
+        node for node in nodes if node["Alive"] and node["Resources"].get("GPU", 0) > 0
+    ]
+    assert len(gpu_nodes) == 2, gpu_nodes
+    assert all(node["Resources"]["GPU"] == 1 for node in gpu_nodes), gpu_nodes
+    owners = {node["NodeID"]: node["NodeManagerAddress"] for node in gpu_nodes}
+    assert len(owners) == len(set(owners.values())) == 2, owners
+    return owners
+
+
+def assert_mp_owners(endpoints, reports, node_ips):
+    assert len(reports) == 2, reports
+    for report in reports:
+        assert endpoints[report["replica_id"]][0] == report["node_ip"], report
+    if node_ips:
+        assert {r["node_id"]: r["node_ip"] for r in reports} == node_ips, reports
+        # Loopback addresses and OS PIDs are unique only within their owner node.
+        assert len({(r["node_id"], r["server_url"]) for r in reports}) == 2, reports
+        assert len({(r["node_id"], r["server_pid"]) for r in reports}) == 2, reports
+    else:
+        assert len({host for host, _ in endpoints.values()}) == 1, endpoints
+        assert len({r["node_id"] for r in reports}) == 1, reports
+        assert len({r["server_url"] for r in reports}) == 2, reports
+        assert len({r["server_pid"] for r in reports}) == 2, reports
 
 
 def mp_report(endpoint):
@@ -79,9 +111,13 @@ def mp_runtime():
             "py_modules": [str(Path(__file__).with_name("lmcache_mp_utils.py"))]
         },
     )
-    yield
-    serve.shutdown()
-    ray.shutdown()
+    try:
+        two_node = os.environ.get("RAY_LMCACHE_MP_TWO_NODE", "0")
+        assert two_node in ("0", "1"), two_node
+        yield two_node_gpu_owners(ray.nodes()) if two_node == "1" else {}
+    finally:
+        serve.shutdown()
+        ray.shutdown()
 
 
 @pytest.fixture(params=[16, 256], ids=["equal-16", "unequal-256"])
@@ -140,7 +176,7 @@ def mp_app(request, mp_runtime):
     try:
         with patch_ingress():
             handle = serve.run(build_kv_app(config), name=APP_NAME)
-        yield handle, chunk_size
+        yield handle, chunk_size, mp_runtime
     finally:
         serve.shutdown()
 
@@ -148,9 +184,10 @@ def mp_app(request, mp_runtime):
 @pytest.mark.asyncio
 @pytest.mark.timeout(900)
 async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
-    handle, chunk_size = mp_app
+    handle, chunk_size, node_ips = mp_app
     endpoints = await discover_replica_endpoints(handle, 2)
-    assert len({host for host, _ in endpoints.values()}) == 1, endpoints
+    if not node_ips:
+        assert len({host for host, _ in endpoints.values()}) == 1, endpoints
     router = serve.get_deployment_handle("LLMRouter", app_name=APP_NAME)
 
     async def registered():
@@ -158,6 +195,11 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
         assert states
         for state in states:
             assert set(state["replicas"].values()) == set(endpoints), state
+        if node_ips:
+            ingresses = await router.broadcast("get_token_push_report").results_async()
+            assert set(node_ips.values()) <= {
+                r["node_ip"] for r in ingresses
+            }, ingresses
         return True
 
     await async_wait_for_condition(registered, timeout=90)
@@ -165,8 +207,7 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
     cached, cold = sorted(state["replicas"])
     a, b = (endpoints[state["replicas"][w]] for w in (cached, cold))
     reports = [mp_report(endpoint) for endpoint in (a, b)]
-    assert len({r["server_url"] for r in reports}) == 2, reports
-    assert len({r["server_pid"] for r in reports}) == 2, reports
+    assert_mp_owners(endpoints, reports, node_ips)
     assert all(r["model_revision"] == MODEL_REVISION for r in reports), reports
     assert all(r["chunk_size"] == chunk_size for r in reports), reports
     assert all(r["healthy"] for r in reports), reports
@@ -265,7 +306,10 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
     await router.broadcast("reset_token_pushes").results_async()
     request_id = f"lmcache-mp-{uuid.uuid4().hex}"
     response = post_chat(
-        ("127.0.0.1", 8000), TARGET, max_tokens=2, request_id=request_id
+        (b[0] if node_ips else "127.0.0.1", 8000),
+        TARGET,
+        max_tokens=2,
+        request_id=request_id,
     )
     routes = await router.broadcast("get_token_push_report").results_async()
     picks = [
@@ -277,6 +321,15 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
     assert picks and all(
         p["replica_id"] == state["replicas"][cached] for p in picks
     ), routes
+    if node_ips:
+        # A first nonblocking push may fall back; the MP load is checked below.
+        assert all(
+            report["node_ip"] == b[0]
+            and urlsplit(push["endpoint"]).hostname == a[0] != b[0]
+            for report in routes
+            for push in report["pushes"]
+            if push["request_id"] == request_id
+        ), routes
     after = [mp_report(endpoint) for endpoint in (a, b)]
     loads = [r for r in after[0]["loads"] if r["request_id"].startswith(response["id"])]
     assert loads and all(r["success"] for r in loads), after
@@ -305,6 +358,8 @@ async def test_lmcache_mp_routes_to_cpu_prefix_and_reloads(mp_app):
                 request_id=request_id,
                 response=response,
                 routes=picks,
+                route_reports=routes,
+                node_ips=node_ips,
                 initial_index=initial_index,
                 cpu_only_scores=cpu_only_scores,
                 idle_loads=idle_loads,
@@ -344,13 +399,68 @@ def test_stop_owned_server_without_observer(monkeypatch):
     launcher.shutdown.assert_called_once_with()
 
 
+def test_two_node_gpu_owners_requires_two_distinct_one_gpu_nodes():
+    nodes = [
+        dict(
+            Alive=True,
+            NodeID=f"node-{i}",
+            NodeManagerAddress=f"10.0.0.{i}",
+            Resources={"GPU": 1},
+        )
+        for i in (1, 2)
+    ]
+    assert two_node_gpu_owners(nodes) == {
+        "node-1": "10.0.0.1",
+        "node-2": "10.0.0.2",
+    }
+    for invalid in (
+        nodes[:1],
+        [nodes[0], dict(nodes[1], Resources={"GPU": 2})],
+        [nodes[0], dict(nodes[1], Alive=False)],
+        [nodes[0], dict(nodes[1], NodeManagerAddress="10.0.0.1")],
+    ):
+        with pytest.raises(AssertionError):
+            two_node_gpu_owners(invalid)
+
+
+def test_mp_owners_allow_loopback_and_pid_reuse_only_across_nodes():
+    endpoints = {"a": ("10.0.0.1", 8001), "b": ("10.0.0.2", 8001)}
+    reports = [
+        dict(
+            replica_id=replica_id,
+            node_id=f"node-{i}",
+            node_ip=f"10.0.0.{i}",
+            server_url="tcp://127.0.0.1:21800",
+            server_pid=123,
+        )
+        for i, replica_id in enumerate(endpoints, 1)
+    ]
+    owners = {"node-1": "10.0.0.1", "node-2": "10.0.0.2"}
+    assert_mp_owners(endpoints, reports, owners)
+    with pytest.raises(AssertionError):
+        assert_mp_owners(
+            endpoints, [reports[0], dict(reports[1], node_id="node-1")], owners
+        )
+    endpoints["b"] = ("10.0.0.1", 8002)
+    reports[1].update(node_id="node-1", node_ip="10.0.0.1")
+    with pytest.raises(AssertionError):
+        assert_mp_owners(endpoints, reports, owners)
+    with pytest.raises(AssertionError):
+        assert_mp_owners(endpoints, reports, {})
+    reports[1]["server_url"] = "tcp://127.0.0.1:21801"
+    with pytest.raises(AssertionError):
+        assert_mp_owners(endpoints, reports, {})
+    reports[1]["server_pid"] = 124
+    assert_mp_owners(endpoints, reports, {})
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize("mp_app", [256], indirect=True, ids=["chunk-256"])
 @pytest.mark.parametrize("operation", ["clear", "restart"])
 async def test_lmcache_mp_idle_invalidation_preserves_live_replicas(mp_app, operation):
     """Real cache changes withdraw CPU hints while model/ingress identities live."""
-    handle, chunk_size = mp_app
+    handle, chunk_size, node_ips = mp_app
     endpoints = await discover_replica_endpoints(handle, 2)
     router = serve.get_deployment_handle("LLMRouter", app_name=APP_NAME)
 
@@ -364,6 +474,11 @@ async def test_lmcache_mp_idle_invalidation_preserves_live_replicas(mp_app, oper
                 state["replicas"]
             ), state
             assert all(w["lifecycle"] == "schedulable" for w in state["workers"]), state
+        if node_ips:
+            ingresses = await router.broadcast("get_token_push_report").results_async()
+            assert set(node_ips.values()) <= {
+                r["node_ip"] for r in ingresses
+            }, ingresses
         return True
 
     await async_wait_for_condition(registered, timeout=90)
@@ -372,6 +487,7 @@ async def test_lmcache_mp_idle_invalidation_preserves_live_replicas(mp_app, oper
     cached, cold = sorted(state["replicas"])
     a, b = (endpoints[state["replicas"][w]] for w in (cached, cold))
     models = [mp_report(endpoint) for endpoint in (a, b)]
+    assert_mp_owners(endpoints, models, node_ips)
     tokens = tokenize_prompt(a, TARGET)
     blocks = len(tokens) // chunk_size * chunk_size // BLOCK_SIZE
     gpu_target = [{"role": "user", "content": "GPU survivor. " + "cobalt pine " * 150}]
@@ -383,6 +499,8 @@ async def test_lmcache_mp_idle_invalidation_preserves_live_replicas(mp_app, oper
     fresh_blocks = len(fresh_tokens) // chunk_size * chunk_size // BLOCK_SIZE
     worker = next(w for w in state["workers"] if w["worker_id"] == cached)
     [event_endpoint] = worker["kv_events_endpoints"].values()
+    if node_ips:
+        assert urlsplit(event_endpoint).hostname == a[0], event_endpoint
     subscriber = zmq.Context.instance().socket(zmq.SUB)
     subscriber.setsockopt(zmq.SUBSCRIBE, b"")
     subscriber.connect(event_endpoint)
@@ -563,11 +681,11 @@ async def test_lmcache_mp_idle_invalidation_preserves_live_replicas(mp_app, oper
         assert all(s["replicas"] == state["replicas"] for s in after_identities)
         before_serving = [mp_report(endpoint) for endpoint in (a, b)]
         for old, new in zip(models, before_serving):
-            assert (new["worker_pid"], new["instance_id"], new["replica_id"]) == (
-                old["worker_pid"],
-                old["instance_id"],
-                old["replica_id"],
-            ), (old, new)
+            keys = ("node_id", "node_ip", "worker_pid", "instance_id", "replica_id")
+            assert tuple(new[k] for k in keys) == tuple(old[k] for k in keys), (
+                old,
+                new,
+            )
         scores = await router.broadcast("get_kv_overlap_scores", tokens).results_async()
         assert all(
             s[cached]["host_pinned_extension_blocks"] == 0 for s in scores
@@ -577,7 +695,9 @@ async def test_lmcache_mp_idle_invalidation_preserves_live_replicas(mp_app, oper
             * BLOCK_SIZE
         )
         assert gpu_credit < blocks * BLOCK_SIZE - 1, scores
-        result = post_chat(("127.0.0.1", 8000), TARGET, max_tokens=2)
+        result = post_chat(
+            (b[0] if node_ips else "127.0.0.1", 8000), TARGET, max_tokens=2
+        )
         assert (
             result["usage"]["prompt_tokens_details"]["cached_tokens"] <= gpu_credit
         ), result
@@ -643,6 +763,7 @@ async def test_lmcache_mp_idle_invalidation_preserves_live_replicas(mp_app, oper
             json.dumps(
                 dict(
                     operation=operation,
+                    node_ips=node_ips,
                     mutation=mutation,
                     timeout=timeout,
                     models=models,

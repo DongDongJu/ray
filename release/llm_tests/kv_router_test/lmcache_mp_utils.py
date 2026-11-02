@@ -5,6 +5,7 @@ import time
 
 import httpx
 
+import ray
 from ray import serve
 from ray.serve.llm import LLMServer
 
@@ -137,6 +138,8 @@ class MPTestServer(LLMServer):
             worker[
                 "replica_id"
             ] = serve.get_replica_context().replica_id.to_full_id_str()
+            worker["node_id"] = ray.get_runtime_context().get_node_id()
+            worker["node_ip"] = ray.util.get_node_ip_address()
             worker["status"] = await self.mp_status()
             return worker
 
