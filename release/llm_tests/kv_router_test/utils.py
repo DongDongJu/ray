@@ -207,6 +207,10 @@ class LLMRouter(_LLMRouter):
         """(Test only) Workers currently tracked from running replicas."""
         return sorted(self._kv_token_tracker._replica_id_by_worker)
 
+    async def get_kv_index_snapshot(self):
+        """(Test only) Actual per-tier placements, without cumulative scoring."""
+        return await self._kv_token_tracker._svc.indexer_snapshot()
+
     def get_registered_worker_ids(self):
         """(Test only) Worker ids the selection service can currently schedule."""
         svc = self._kv_token_tracker._svc

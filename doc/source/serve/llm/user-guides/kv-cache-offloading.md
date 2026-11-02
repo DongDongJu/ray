@@ -214,6 +214,35 @@ serve run config.yaml
 :::
 ::::
 
+### Validate replica-local LMCache MP routing
+
+:::{note}
+The MP routing test requires the unmerged native-event LMCache change at commit `38fc36efd6476307cc0504fe039e039277d0b771`, vLLM 0.31.0, and Dynamo runtime `1.6.0.dev20260918`. The standard Ray LLM image doesn't include that LMCache artifact. Before building the manual `llm_serve_kv_router_lmcache_mp` release job, set `cluster.byod.runtime_env.LMCACHE_MP_WHEEL` to a reviewed immutable wheel URL. Its empty default fails the image build. This dependency gate must be resolved before treating the configuration as released support.
+:::
+
+Use the external `LMCacheMPConnector` module so vLLM loads the selected LMCache installation. The release test uses the following connector settings with `chunk_size` set to 16 and 256 and the engine block size fixed at 16:
+
+```{literalinclude} ../../../../../release/llm_tests/kv_router_test/test_lmcache_mp_events.py
+:language: python
+:start-after: # __lmcache_mp_config_start__
+:end-before: # __lmcache_mp_config_end__
+:dedent: 12
+```
+
+Assign each model replica its own `lmcache.mp.server_urls` entry before engine startup. The test's `LLMConfig.server_cls` supplies distinct local ZMQ, HTTP, and metrics ports using the replica's local rank. Worker-owned autostart launches MP on the model's GPU node with its assigned GPU visibility. Supplying the same server URL to both replicas would create a shared cache and wouldn't validate replica-local routing.
+
+The test covers one Linux GPU node, two TP=1 replicas, and separate DRAM caches. It warms a target, displaces its GPU blocks with other prompts, and waits for CPU-only availability and idle worker loads. It then sends the target through the public ingress and correlates the selected replica with a successful connector retrieve result. A generic cached-token count alone doesn't distinguish an MP load from a GPU hit or fallback recomputation.
+
+See the complete {download}`MP test fixture <../../../../../release/llm_tests/kv_router_test/test_lmcache_mp_events.py>` and its {download}`worker and process helper <../../../../../release/llm_tests/kv_router_test/lmcache_mp_utils.py>`. With the gated test image and a running Ray cluster containing two GPUs, run from the Ray checkout:
+
+```bash
+python -m pytest -vs release/llm_tests/kv_router_test/test_lmcache_mp_events.py
+```
+
+:::{note}
+The native-event dependency above doesn't provide bounded invalidation delivery while vLLM is idle. CPU eviction and MP restart need separate validation before deployments can rely on prompt withdrawal of stale routing hints.
+:::
+
 ## Compose multiple KV transfer backends with MultiConnector
 
 You can combine multiple KV transfer backends using `MultiConnector`. This is useful when you want both local offloading and cross-instance transfer in disaggregated deployments.
