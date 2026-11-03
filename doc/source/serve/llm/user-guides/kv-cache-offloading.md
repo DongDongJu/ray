@@ -217,8 +217,22 @@ serve run config.yaml
 ### Validate replica-local LMCache MP routing
 
 :::{note}
-The MP routing and invalidation tests require the unmerged LMCache scheduler-event change at commit `70da29961e266d6318179eb1a41d37b6c47fc330`, the vLLM idle-event change at commit `6232e45f29eee29df83de5d8bd48fede866898f3` backported to vLLM 0.31.0, and Dynamo runtime `1.6.0.dev20260918`. The standard Ray LLM image doesn't include these artifacts. Before building the manual `llm_serve_kv_router_lmcache_mp` release job, set `cluster.byod.runtime_env.LMCACHE_MP_WHEEL` and `VLLM_KV_EVENTS_WHEEL` to reviewed immutable wheel URLs. Their empty defaults fail the image build. LMCache's CUDA binary must include SM89 for the job's L4 GPUs. These dependency gates must be resolved before treating the configuration as released support.
+The MP routing and invalidation tests require reviewed LMCache native-event and vLLM idle-event changes. The integration recipe uses vLLM 0.33, Torch 2.14 with CUDA 13, LMCache `0.5.7rc4.dev32`, and Dynamo `1.7.0`. The standard Ray LLM image doesn't include this combination. The Dynamo wheel requires glibc 2.39 or later, so build a compatible Ubuntu 24.04 custom image. The stock Ubuntu 22.04 `llm-cu130` base can't install that wheel. LMCache's CUDA binary must include SM89 for the job's L4 GPUs. These owner changes and artifacts still require acceptance before this configuration represents released support.
 :::
+
+The manual `llm_serve_kv_router_lmcache_mp` job requires four immutable wheel URLs in `cluster.byod.runtime_env`: `RAY_LATEST_WHEEL_URL`, `VLLM_LATEST_WHEEL_URL`, `LMCACHE_LATEST_WHEEL_URL`, and `DYNAMO_LATEST_WHEEL_URL`. Set `RAY_EXPECTED_COMMIT` to the native Ray wheel's full commit SHA. Set `RAY_PYTHON_SOURCE_REPO` and `RAY_PYTHON_SOURCE_COMMIT` to the reviewed integration repository and full Python-source commit SHA. Empty inputs fail the image build.
+
+The {download}`shared installer <../../../../../release/ray_release/byod/byod_llm_lmcache_mp_test.sh>` runs from the one-script BYOD build context. It verifies Python 3.12 and a virtual or conda environment, fetches the exact source commit, resolves the wheels' declared dependencies, applies Ray's device-aware vLLM compile-cache patch, and installs the selected Ray Python source with `setup-dev.py`. It records the native and Python-source revisions separately. Use an environment with no Ray installation or a normal Ray wheel. The installer rejects existing Ray source links and editable imports before changing packages to preserve their checkouts. A native Ray wheel without the integration's Python changes doesn't reproduce this configuration.
+
+For an existing clean checkout and a fresh virtual environment, run the {download}`checkout wrapper <../../../../../release/llm_tests/kv_router_test/install_latest_integration.sh>` with the four wheel variables and `RAY_EXPECTED_COMMIT` set. The wrapper supplies the checkout path and its commit to the same installer:
+
+```bash
+bash release/llm_tests/kv_router_test/install_latest_integration.sh
+```
+
+Build and review the compatible custom image before running the cloud job. Review the release driver's environment file and the job definition for your authorized target. The repository's `aws.env` selects Anyscale staging and overwrites the shell's `ANYSCALE_HOST`. Configure the authorized endpoint in that environment file, set `ANYSCALE_PROJECT`, set the job's `cluster.cloud`, and set `RELEASE_AWS_BUCKET` to accessible storage for runfiles and results. The repository's automation defaults don't establish access to your project.
+
+Use the release runner's `--test-collection-file` option for the reviewed job definition and `--image` for the custom image's immutable registry reference. Keep the test checkout at the matching Python-source commit. Leave `RAY_COMMIT_OF_WHEEL` unset to prevent the wrapper from resetting that checkout to the distinct native-wheel commit. Authentication, registry and storage access, and L4 capacity remain prerequisites for submission. The local Blackwell results don't establish an L4 execution.
 
 Use the external `LMCacheMPConnector` module so vLLM loads the selected LMCache installation. The release test uses the following connector settings with `chunk_size` set to 16 and 256 and the engine block size fixed at 16:
 

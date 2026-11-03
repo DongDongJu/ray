@@ -5252,14 +5252,20 @@
     byod:
       type: llm-cu130
       runtime_env:
-        # Supply a reviewed immutable wheel URL before building this manual job.
-        LMCACHE_MP_WHEEL: ""
-        VLLM_KV_EVENTS_WHEEL: ""
+        # Build a reviewed Ubuntu 24.04/glibc 2.39+ custom image, then pass
+        # --image to the release runner. The stock Ubuntu 22.04 base is unsupported.
+        RAY_LATEST_WHEEL_URL: ""
+        VLLM_LATEST_WHEEL_URL: ""
+        LMCACHE_LATEST_WHEEL_URL: ""
+        DYNAMO_LATEST_WHEEL_URL: ""
+        RAY_EXPECTED_COMMIT: ""
+        RAY_PYTHON_SOURCE_REPO: ""
+        RAY_PYTHON_SOURCE_COMMIT: ""
         RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING: "1"
         RAY_SERVE_ENABLE_HA_PROXY: "1"
         RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY: "1"
         RAY_SERVE_DEFAULT_HTTP_HOST: "0.0.0.0"
-      # Requires an explicit reviewed wheel; the native-event change is unmerged.
+      # Empty inputs fail the build. Owner changes still require acceptance.
       post_build_script: byod_llm_lmcache_mp_test.sh
     anyscale_sdk_2026: true
     cluster_compute: llm_4xl4.yaml
